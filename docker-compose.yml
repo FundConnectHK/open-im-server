@@ -244,7 +244,7 @@ services:
     ports:
       - "10005:9000"
       - "19090:9090"
-    container_name: minio
+    container_name: openim-minio
     volumes:
       - "${DATA_DIR}/components/mnt/data:/data"
       - "${DATA_DIR}/components/mnt/config:/root/.minio"
@@ -266,14 +266,14 @@ services:
     networks:
       - openim
 
-  # openim-admin-front:
-  #   image: ${OPENIM_ADMIN_FRONT_IMAGE}
-  #   container_name: openim-admin-front
-  #   restart: always
-  #   ports:
-  #     - "11002:80"
-  #   networks:
-  #     - openim
+  openim-admin-front:
+    image: ${OPENIM_ADMIN_FRONT_IMAGE}
+    container_name: openim-admin-front
+    restart: always
+    ports:
+      - "11002:80"
+    networks:
+      - openim
 
   prometheus:
     image: ${PROMETHEUS_IMAGE}
