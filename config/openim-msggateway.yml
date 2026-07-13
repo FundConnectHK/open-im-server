@@ -1,6 +1,6 @@
 rpc:
   # The IP address where this RPC service registers itself; if left blank, it defaults to the internal network IP
-  registerIP:
+  registerIP: 127.0.0.1
   # autoSetPorts indicates whether to automatically set the ports
   # if you use in kubernetes, set it to false
   autoSetPorts: true
