@@ -154,7 +154,6 @@ func (s *userServer) GetDesignateUsers(ctx context.Context, req *pbuser.GetDesig
 }
 
 // deprecated:
-// UpdateUserInfo
 func (s *userServer) UpdateUserInfo(ctx context.Context, req *pbuser.UpdateUserInfoReq) (resp *pbuser.UpdateUserInfoResp, err error) {
 	resp = &pbuser.UpdateUserInfoResp{}
 	err = authverify.CheckAccess(ctx, req.UserInfo.UserID)
