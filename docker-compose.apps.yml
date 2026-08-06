@@ -1,0 +1,85 @@
+# Application containers for local OpenIM on macOS (merged with docker-compose.yml).
+# Started by make run when SERVICE_CORE_OPENIM_RUNTIME=docker (default on Darwin).
+
+services:
+  kafka:
+    environment:
+      KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://kafka:9094"
+
+  openim-server:
+    container_name: openim-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${SERVICE_CORE_OPENIM_SERVER_IMAGE:-service-core-local-openim-server:latest}
+    pull_policy: never
+    init: true
+    ports:
+      - "10001:10001"
+      - "10002:10002"
+    environment:
+      IMENV_MONGODB_ADDRESS: mongodb:27017
+      IMENV_MONGODB_USERNAME: openIM
+      IMENV_MONGODB_PASSWORD: openIM123
+      IMENV_KAFKA_ADDRESS: kafka:9094
+      IMENV_DISCOVERY_ETCD_ADDRESS: etcd:2379
+      IMENV_REDIS_ADDRESS: redis:6379
+      IMENV_REDIS_PASSWORD: openIM123
+      IMENV_MINIO_INTERNALADDRESS: minio:9000
+      IMENV_MINIO_EXTERNALADDRESS: http://127.0.0.1:10005
+      IMENV_MINIO_ACCESSKEYID: root
+      IMENV_MINIO_SECRETACCESSKEY: openIM123
+      IMENV_SHARE_SECRET: ${SERVICE_CORE_OPENIM_SECRET:-openIM123}
+      IMENV_LOG_ISSTDOUT: "true"
+      IMENV_LOG_REMAINLOGLEVEL: "6"
+    depends_on:
+      - mongodb
+      - redis
+      - etcd
+      - kafka
+      - minio
+    restart: unless-stopped
+    networks:
+      - openim
+    healthcheck:
+      test: ["CMD", "sh", "-c", "mage check"]
+      interval: 10s
+      timeout: 60s
+      retries: 12
+      start_period: 30s
+
+  openim-chat:
+    container_name: openim-chat
+    build:
+      context: ../chat
+      dockerfile: Dockerfile
+    image: ${SERVICE_CORE_OPENIM_CHAT_IMAGE:-service-core-local-openim-chat:latest}
+    pull_policy: never
+    init: true
+    ports:
+      - "10008:10008"
+      - "10009:10009"
+      - "10010:10010"
+    environment:
+      CHATENV_MONGODB_ADDRESS: mongodb:27017
+      CHATENV_MONGODB_USERNAME: openIM
+      CHATENV_MONGODB_PASSWORD: openIM123
+      CHATENV_DISCOVERY_ETCD_ADDRESS: etcd:2379
+      CHATENV_REDIS_ADDRESS: redis:6379
+      CHATENV_REDIS_PASSWORD: openIM123
+      CHATENV_SHARE_OPENIM_SECRET: ${SERVICE_CORE_OPENIM_SECRET:-openIM123}
+      CHATENV_SHARE_OPENIM_APIURL: http://openim-server:10002
+      CHATENV_LOG_ISSTDOUT: "true"
+      CHATENV_LOG_REMAINLOGLEVEL: "6"
+    depends_on:
+      openim-server:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - openim
+    healthcheck:
+      test: ["CMD", "sh", "-c", "mage check"]
+      interval: 10s
+      timeout: 60s
+      retries: 12
+      start_period: 30s
