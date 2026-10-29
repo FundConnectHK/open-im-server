@@ -57,6 +57,20 @@ type VersionLog struct {
 	LogLen     int                `bson:"log_len"`
 }
 
+// Missing rows with explicit or compacted deletion history must not be
+// recreated by automatic repair.
+func (v *VersionLog) WasDeleted(id string) bool {
+	if v == nil {
+		return false
+	}
+	for _, entry := range v.Logs {
+		if entry.EID == id {
+			return entry.State == VersionStateDelete
+		}
+	}
+	return v.Deleted > 0
+}
+
 func (v *VersionLog) DeleteAndChangeIDs() (insertIds, deleteIds, updateIds []string) {
 	for _, l := range v.Logs {
 		switch l.State {

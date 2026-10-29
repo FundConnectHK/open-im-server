@@ -16,6 +16,7 @@ package mgo
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/database"
@@ -33,7 +34,20 @@ import (
 
 func NewConversationMongo(db *mongo.Database) (*ConversationMgo, error) {
 	coll := db.Collection(database.ConversationName)
-	_, err := coll.Indexes().CreateMany(context.Background(), []mongo.IndexModel{
+	if err := ensureConversationIndexes(context.Background(), coll); err != nil {
+		return nil, errs.Wrap(err)
+	}
+	version, err := NewVersionLog(db.Collection(database.ConversationVersionName))
+	if err != nil {
+		return nil, err
+	}
+	return &ConversationMgo{version: version, coll: coll}, nil
+}
+
+// Each member owns a separate row for the same conversation. Only the pair
+// (owner_user_id, conversation_id) is unique; conversation_id is a lookup key.
+func ensureConversationIndexes(ctx context.Context, coll *mongo.Collection) error {
+	_, err := coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{
 			Keys: bson.D{
 				{Key: "owner_user_id", Value: 1},
@@ -51,22 +65,59 @@ func NewConversationMongo(db *mongo.Database) (*ConversationMgo, error) {
 			Keys: bson.D{
 				{Key: "conversation_id", Value: 1},
 			},
-			Options: options.Index().SetUnique(true),
+			Options: options.Index().SetName("conversation_id_lookup"),
 		},
 	})
 	if err != nil {
-		return nil, errs.Wrap(err)
+		return err
 	}
-	version, err := NewVersionLog(db.Collection(database.ConversationVersionName))
+	// Install the correct constraints before removing the old global unique
+	// index. Use a different lookup name so concurrent initializers cannot drop
+	// a freshly recreated replacement using a stale index-list result.
+	cursor, err := coll.Indexes().List(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &ConversationMgo{version: version, coll: coll}, nil
+	var indexes []struct {
+		Name   string `bson:"name"`
+		Key    bson.D `bson:"key"`
+		Unique bool   `bson:"unique"`
+	}
+	if err := cursor.All(ctx, &indexes); err != nil {
+		return err
+	}
+	for _, index := range indexes {
+		if !index.Unique || len(index.Key) != 1 || index.Key[0].Key != "conversation_id" {
+			continue
+		}
+		if _, err := coll.Indexes().DropOne(ctx, index.Name); err != nil {
+			var commandErr mongo.CommandError
+			if !errors.As(err, &commandErr) || commandErr.Code != 27 { // IndexNotFound: another initializer removed it.
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type ConversationMgo struct {
 	version database.VersionLog
 	coll    *mongo.Collection
+}
+
+func (c *ConversationMgo) ConversationWasDeleted(ctx context.Context, userID, conversationID string) (bool, error) {
+	var history model.VersionLogTable
+	err := c.coll.Database().Collection(database.ConversationVersionName).FindOne(ctx,
+		bson.M{"d_id": userID}, options.FindOne().SetProjection(bson.M{
+			"deleted": 1, "logs": bson.M{"$elemMatch": bson.M{"e_id": conversationID}},
+		})).Decode(&history)
+	if err == mongo.ErrNoDocuments {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return history.VersionLog().WasDeleted(conversationID), nil
 }
 
 func (c *ConversationMgo) Create(ctx context.Context, conversations []*model.Conversation) (err error) {

@@ -30,6 +30,7 @@ import (
 	"github.com/openimsdk/open-im-server/v3/pkg/common/servererrs"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/cache/redis"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/controller"
+	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/database"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/storage/database/mgo"
 	dbModel "github.com/openimsdk/open-im-server/v3/pkg/common/storage/model"
 	"github.com/openimsdk/open-im-server/v3/pkg/common/webhook"
@@ -43,6 +44,7 @@ import (
 	"github.com/openimsdk/tools/errs"
 	"github.com/openimsdk/tools/log"
 	"github.com/openimsdk/tools/utils/datautil"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
 type conversationServer struct {
@@ -56,6 +58,8 @@ type conversationServer struct {
 	userClient    *rpcli.UserClient
 	msgClient     *rpcli.MsgClient
 	groupClient   *rpcli.GroupClient
+	seqUser       database.SeqUser
+	wasDeleted    func(context.Context, string, string) (bool, error)
 }
 
 type Config struct {
@@ -83,6 +87,10 @@ func Start(ctx context.Context, config *Config, client discovery.SvcDiscoveryReg
 	if err != nil {
 		return err
 	}
+	seqUser, err := mgo.NewSeqUserMongo(mgocli.GetDB())
+	if err != nil {
+		return err
+	}
 	userConn, err := client.GetConn(ctx, config.Discovery.RpcService.User)
 	if err != nil {
 		return err
@@ -104,6 +112,8 @@ func Start(ctx context.Context, config *Config, client discovery.SvcDiscoveryReg
 		userClient:    rpcli.NewUserClient(userConn),
 		groupClient:   rpcli.NewGroupClient(groupConn),
 		msgClient:     msgClient,
+		seqUser:       seqUser,
+		wasDeleted:    conversationDB.ConversationWasDeleted,
 	}
 
 	cs.conversationNotificationSender = NewConversationNotificationSender(&config.NotificationConfig, msgClient)
@@ -440,6 +450,31 @@ func (c *conversationServer) CreateSingleChatConversations(ctx context.Context, 
 }
 
 func (c *conversationServer) CreateGroupChatConversations(ctx context.Context, req *pbconversation.CreateGroupChatConversationsReq) (*pbconversation.CreateGroupChatConversationsResp, error) {
+	if rpcli.IsConversationRecovery(ctx) {
+		if err := authverify.CheckAdmin(ctx); err != nil {
+			return nil, err
+		}
+		return c.recoverGroupChatConversations(ctx, req)
+	}
+	var conversation dbModel.Conversation
+	conversation.ConversationID = msgprocessor.GetConversationIDBySessionType(constant.ReadGroupChatType, req.GroupID)
+	conversation.GroupID = req.GroupID
+	conversation.ConversationType = constant.ReadGroupChatType
+	conversation.CreateTime = time.Now()
+	if err := c.webhookBeforeCreateGroupChatConversations(ctx, &c.config.WebhooksConfig.BeforeCreateGroupChatConversations, &conversation); err != nil {
+		return nil, err
+	}
+	if err := c.conversationDatabase.CreateGroupChatConversation(ctx, req.GroupID, req.UserIDs, &conversation); err != nil {
+		return nil, err
+	}
+	if err := c.msgClient.SetUserConversationMaxSeq(ctx, conversation.ConversationID, req.UserIDs, 0); err != nil {
+		return nil, err
+	}
+	c.webhookAfterCreateGroupChatConversations(ctx, &c.config.WebhooksConfig.AfterCreateGroupChatConversations, &conversation)
+	return &pbconversation.CreateGroupChatConversationsResp{}, nil
+}
+
+func (c *conversationServer) recoverGroupChatConversations(ctx context.Context, req *pbconversation.CreateGroupChatConversationsReq) (*pbconversation.CreateGroupChatConversationsResp, error) {
 	var conversation dbModel.Conversation
 
 	conversation.ConversationID = msgprocessor.GetConversationIDBySessionType(constant.ReadGroupChatType, req.GroupID)
@@ -451,12 +486,57 @@ func (c *conversationServer) CreateGroupChatConversations(ctx context.Context, r
 		return nil, err
 	}
 
-	err := c.conversationDatabase.CreateGroupChatConversation(ctx, req.GroupID, req.UserIDs, &conversation)
+	group, err := c.groupClient.GetGroupInfo(ctx, req.GroupID)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.msgClient.SetUserConversationMaxSeq(ctx, conversation.ConversationID, req.UserIDs, 0); err != nil {
+	if group == nil || group.Status == constant.GroupStatusDismissed {
+		return nil, servererrs.ErrDismissedAlready.WrapMsg("group unavailable")
+	}
+	members, err := c.groupClient.GetGroupMemberUserIDs(ctx, req.GroupID)
+	if err != nil {
 		return nil, err
+	}
+	for _, userID := range req.UserIDs {
+		if !datautil.Contain(userID, members...) {
+			return nil, errs.ErrNoPermission.WrapMsg("not a current group member")
+		}
+	}
+	for _, userID := range req.UserIDs {
+		existing, err := c.conversationDatabase.FindConversations(ctx, userID, []string{conversation.ConversationID})
+		if err != nil {
+			return nil, err
+		}
+		if len(existing) > 0 {
+			continue
+		}
+		deleted, err := c.wasDeleted(ctx, userID, conversation.ConversationID)
+		if err != nil {
+			return nil, err
+		}
+		if deleted {
+			continue
+		}
+		row := conversation
+		row.OwnerUserID = userID
+		row.MinSeq, err = c.seqUser.GetUserMinSeq(ctx, row.ConversationID, userID)
+		if err != nil {
+			return nil, err
+		}
+		row.MaxSeq, err = c.seqUser.GetUserMaxSeq(ctx, row.ConversationID, userID)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.conversationDatabase.CreateConversation(ctx, []*dbModel.Conversation{&row}); err != nil {
+			if !mongo.IsDuplicateKeyError(err) {
+				return nil, err
+			}
+			// A simultaneous repair can win the unique owner/conversation pair.
+			rows, loadErr := c.conversationDatabase.FindConversations(ctx, userID, []string{row.ConversationID})
+			if loadErr != nil || len(rows) == 0 {
+				return nil, err
+			}
+		}
 	}
 
 	c.webhookAfterCreateGroupChatConversations(ctx, &c.config.WebhooksConfig.AfterCreateGroupChatConversations, &conversation)
