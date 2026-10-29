@@ -15,7 +15,13 @@
 package api
 
 import (
+	"context"
+
 	"github.com/gin-gonic/gin"
+	"github.com/openimsdk/open-im-server/v3/pkg/authverify"
+	"github.com/openimsdk/open-im-server/v3/pkg/rpcli"
+	"github.com/openimsdk/tools/apiresp"
+	"google.golang.org/grpc"
 
 	"github.com/openimsdk/protocol/conversation"
 	"github.com/openimsdk/tools/a2r"
@@ -23,6 +29,18 @@ import (
 
 type ConversationApi struct {
 	Client conversation.ConversationClient
+}
+
+// EnsureGroupConversations is an internal service repair operation, never a
+// client privilege: membership and visibility are rechecked by the RPC.
+func (o *ConversationApi) EnsureGroupConversations(c *gin.Context) {
+	if err := authverify.CheckAdmin(c); err != nil {
+		apiresp.GinError(c, err)
+		return
+	}
+	a2r.Call(c, func(client conversation.ConversationClient, ctx context.Context, req *conversation.CreateGroupChatConversationsReq, options ...grpc.CallOption) (*conversation.CreateGroupChatConversationsResp, error) {
+		return client.CreateGroupChatConversations(rpcli.WithConversationRecovery(ctx), req, options...)
+	}, o.Client)
 }
 
 func NewConversationApi(client conversation.ConversationClient) ConversationApi {
